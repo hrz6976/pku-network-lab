@@ -8,7 +8,7 @@
 #include <iostream>
 
 // make idea happy
-#include <netinet/in.h>
+//#include <netinet/in.h>
 
 using namespace std;
 
@@ -24,8 +24,8 @@ extern void stud_tcp_output(char *pData, unsigned short len, unsigned char flag,
 
 #define MAX_OPEN_FD 100
 #define PORT_OFFSET 1024
-#define DEFAULT_ACK 1
-#define DEFAULT_SEQ 1
+#define DEFAULT_ACK 0
+#define DEFAULT_SEQ 0
 
 /*
 struct sockaddr_in {
@@ -93,15 +93,17 @@ enum TCPStatus {
     UNUSED, SYN_SENT, ESTABLISHED, FIN_WAIT1, FIN_WAIT2, TIME_WAIT, CLOSED
 };
 
+// When sending new packet:
+// seq = nextSeq, ack = nextAck
 struct TCBEntry {
     uint32_t srcAddr, destAddr;
     uint16_t srcPort, destPort;
-    uint32_t window, recvSeq, sendSeq;  // for next send packet or recv packet
+    uint32_t window, nextAck, nextSeq;
     uint16_t status = UNUSED;
 
     void print(){
         printf("srcPort = %d destPort = %d ", srcPort, destPort);
-        printf("sendSeq = %d, recvSeq = %d ", sendSeq, recvSeq);
+        printf("nextSeq = %d, nextAck = %d ", nextSeq, nextAck);
         printf("windowSize = %d, status = %d ", window, status);
         printf("\n");
     }
@@ -120,7 +122,7 @@ int getTcbByIp(uint32_t srcAddr, uint16_t srcPort, uint32_t destAddr, uint32_t d
     return -1;
 }
 
-// return index of empty tcp
+// return index of empty tcb
 int getTcbEmpty(){
     for(int i = 0; i < MAX_OPEN_FD; i++){
         TCBEntry* it = &TCBTable[i];
@@ -172,16 +174,18 @@ int stud_tcp_input(char *pBuffer, unsigned short len, unsigned int srcAddr, unsi
     // lookup connection in table
     int connIdx = getTcbByIp(srcAddr, info.srcPort, dstAddr, info.destPort);
     assert(connIdx != -1);
+    TCBTable[connIdx].print();
+
     if(TCBTable[connIdx].status == SYN_SENT){
         // expect Syn Ack
         if(!(info.is_syn && info.is_ack)) return 1;
-        if(info.ackNo != TCBTable[connIdx].sendSeq + 1){
+        if(info.ackNo != TCBTable[connIdx].nextSeq + 1){  // seq of packet sent
             tcp_DiscardPkt(pBuffer, STUD_TCP_TEST_SEQNO_ERROR);
             return 1;
         }
         // valid Syn Ack
-        TCBTable[connIdx].sendSeq += 1;
-        TCBTable[connIdx].recvSeq = info.seqNo + 1;
+        TCBTable[connIdx].nextSeq += 1;
+        TCBTable[connIdx].nextAck = info.seqNo + 1;
         TCBTable[connIdx].status = ESTABLISHED;
 
         // send Ack
@@ -190,25 +194,49 @@ int stud_tcp_input(char *pBuffer, unsigned short len, unsigned int srcAddr, unsi
                         srcAddr, dstAddr);
 
     }else if(TCBTable[connIdx].status == ESTABLISHED){  // expect valid transmission
-
-
+        if(!info.is_ack){  // data packet
+            return 0;
+        }else if(info.is_ack){  // ack
+            if(info.ackNo != TCBTable[connIdx].nextSeq + 1){
+                tcp_DiscardPkt(pBuffer, STUD_TCP_TEST_SEQNO_ERROR);
+                return 1;
+            }
+            if(info.is_fin) {  // fin ack
+                // send Ack
+                TCBTable[connIdx].nextSeq += 1;
+                stud_tcp_output(NULL, 0, PACKET_TYPE_ACK,
+                                TCBTable[connIdx].srcPort, TCBTable[connIdx].destPort,
+                                srcAddr, dstAddr);
+                TCBTable[connIdx].status = CLOSED;
+            }
+        }
     }else if(TCBTable[connIdx].status == FIN_WAIT1){
         // expect Ack
         if(!info.is_ack) return 1;
-        if(info.ackNo != TCBTable[connIdx].sendSeq + 1){
+        if(info.ackNo != TCBTable[connIdx].nextSeq + 1){
             tcp_DiscardPkt(pBuffer, STUD_TCP_TEST_SEQNO_ERROR);
             return 1;
         }
         // valid Ack
         TCBTable[connIdx].status = FIN_WAIT2;
 
+        if(info.is_fin) {  // fin ack
+            TCBTable[connIdx].nextSeq += 1;
+            // send Ack
+            stud_tcp_output(NULL, 0, PACKET_TYPE_ACK,
+                            TCBTable[connIdx].srcPort, TCBTable[connIdx].destPort,
+                            srcAddr, dstAddr);
+            TCBTable[connIdx].status = CLOSED;
+        }
+
     }else if(TCBTable[connIdx].status == FIN_WAIT2){ // expect fin ack
         // expect Fin Ack
         if(!info.is_ack || !info.is_fin) return 1;
-        if(info.ackNo != TCBTable[connIdx].sendSeq + 1){
+        if(info.ackNo != TCBTable[connIdx].nextSeq + 1){
             tcp_DiscardPkt(pBuffer, STUD_TCP_TEST_SEQNO_ERROR);
             return 1;
         }
+        TCBTable[connIdx].nextSeq += 1;
         // valid Fin Ack
         TCBTable[connIdx].status = CLOSED;
         // send Fin Ack
@@ -219,23 +247,28 @@ int stud_tcp_input(char *pBuffer, unsigned short len, unsigned int srcAddr, unsi
     return 0;
 }
 
+// pseudo header | tcp header | payload
+// Bits:  [0-95] |[96-159]    |[160-N]
+// Bytes: [0-11] |[12-19]     |[20-N]
+// Ints:  [0-5]  |[6-9]       |[10-N]
+// Words: [0-2]  |[3-4]       |[5-N]
 void stud_tcp_output(char *pData, unsigned short len, unsigned char flag, unsigned short srcPort, unsigned short dstPort, unsigned int srcAddr, unsigned int dstAddr){
-    // [0-95] pseudo header  [96-159] tcp header [160-N] payload
+
     bool is_syn = false;
     bool is_ack = false;
     bool is_fin = false;
-    if(flag == PACKET_TYPE_SYN){ is_syn = true; }
+    if (flag == PACKET_TYPE_SYN){ is_syn = true; }
     else if (flag == PACKET_TYPE_SYN_ACK) { is_syn = true; is_ack = true; }
     else if (flag == PACKET_TYPE_ACK) { is_ack = true; }
     else if (flag == PACKET_TYPE_FIN) { is_fin = true; }
     else if (flag == PACKET_TYPE_FIN_ACK) { is_fin = true;  is_ack = true;}
 
-    int connIdx = getTcbByIp(srcAddr, info.srcPort, dstAddr, info.destPort);
+    int connIdx = getTcbByIp(srcAddr, srcPort, dstAddr, dstPort);
     assert(connIdx != -1);
 
-    uint32_t nextSeqNo = TCBTable[connIdx].sendSeq;
-    uint32_t nextAckNo = TCBTable[connIdx].recvSeq;
-    uint16_t nextWindow = 0;
+    uint32_t nextSeqNo = TCBTable[connIdx].nextSeq;
+    uint32_t nextAckNo = TCBTable[connIdx].nextAck;
+    uint16_t nextWindow = TCBTable[connIdx].window;
 
     // make a packet
 
@@ -272,7 +305,7 @@ void stud_tcp_output(char *pData, unsigned short len, unsigned char flag, unsign
     printf("[INPUT] ");
     info.print();
 
-    // send packet without pseudo header?
+    // send packet with pseudo header?
     tcp_sendIpPkt(temp, len + 20, srcAddr, dstAddr, 64);
 }
 
@@ -280,11 +313,16 @@ int stud_tcp_socket(int domain, int type, int protocol){  // allocate a new sock
     int emptyIdx = getTcbEmpty();
     assert(emptyIdx != -1);
 
-    TCBTable[emptyIdx].status = CLOSED;
-    TCBTable[emptyIdx].srcAddr = getIpv4Address();
-    TCBTable[emptyIdx].srcPort = PORT_OFFSET + emptyIdx;
-    TCBTable[emptyIdx].sendSeq = DEFAULT_ACK;
-    TCBTable[emptyIdx].recvSeq = DEFAULT_SEQ;
+    TCBEntry *it = &TCBTable[emptyIdx];
+    it->status = CLOSED;
+    it->srcAddr = getIpv4Address();
+    it->srcPort = PORT_OFFSET + emptyIdx;
+    it->nextSeq = DEFAULT_ACK;
+    it->nextAck = DEFAULT_SEQ;
+    it->window = 1;  // stop n wait
+
+    printf("[SOCKET] ");
+    it->print();
 
     return emptyIdx;
 }
@@ -294,21 +332,26 @@ int stud_tcp_connect(int sockfd, struct sockaddr_in *addr, int addrlen){
     it->destAddr = ntohl(addr->sin_addr.s_addr);  // uint32
     it->destPort = ntohs(addr->sin_port); // uint16
 
-    char* buffer[1024];
-
     // send syn
     stud_tcp_output(NULL, 0, PACKET_TYPE_SYN, it->srcPort, it->destPort, it->srcAddr, it->destAddr);
     it->status = SYN_SENT;
 
     // wait for syn ack
-    waitIpPacket((char*)buffer,6);
+    char buffer[1024];
+    if(waitIpPacket((char*)buffer,6) == -1) return -1;
     TCPHeaderInfo info = TCPHeaderInfo((char*)buffer);
+    printf("[CONNECT] ");
+    info.print();
+
+    if(info.ackNo != it->nextSeq + 1){
+        tcp_DiscardPkt(buffer, STUD_TCP_TEST_SEQNO_ERROR);
+    }
     if(info.is_ack && info.is_syn){
-        it->recvSeq = info.seqNo + 1;
-        it->sendSeq = info.seqNo + 1;
+        it->nextAck = info.seqNo + 1;
+        it->nextSeq = info.seqNo + 1;
         it->status = ESTABLISHED;
     } else {
-        return 1;  // failed
+        return -1;  // failed
     }
     // send ack
     stud_tcp_output(NULL, 0, PACKET_TYPE_ACK, it->srcPort, it->destPort, it->srcAddr, it->destAddr);
@@ -316,16 +359,69 @@ int stud_tcp_connect(int sockfd, struct sockaddr_in *addr, int addrlen){
 }
 
 int stud_tcp_send(int sockfd, const unsigned char *pData, unsigned short datalen, int flags){
+    TCBEntry* it = &TCBTable[sockfd];
+    printf("[SEND] ");
+    it->print();
 
+    if(it->status != ESTABLISHED){
+        return -1;
+    }
+    stud_tcp_output((char*)pData, datalen, flags, it->srcPort, it->destPort, it->srcAddr, it->destAddr);
+
+    // expect Ack
+    char buffer[1024];
+    if(waitIpPacket((char*)buffer,6) == -1) return -1;
+    TCPHeaderInfo info = TCPHeaderInfo((char*)buffer);
+    info.print();
+    if(!info.is_ack) return -1;
+    return 0;
 }
 
 int stud_tcp_recv(int sockfd, unsigned char *pData, unsigned short datalen, int flags){
+    TCBEntry* it = &TCBTable[sockfd];
+    printf("[RECV] ");
+    it->print();
+
+    if(it->status != ESTABLISHED){
+        return -1;
+    }
+
+    // expect Data
+    char buffer[1024];
+    if(waitIpPacket((char*)buffer,6) == -1) return -1;
+    TCPHeaderInfo info = TCPHeaderInfo((char*)buffer);
+    info.print();
+    if(!info.is_ack) return -1;
+
+    it->nextAck = info.seqNo + datalen;
+
+    // send Ack
+    stud_tcp_output(NULL, 0, PACKET_TYPE_ACK, it->srcPort, it->destPort, it->srcAddr, it->destAddr);
+
+    return 0;
 }
 
 int stud_tcp_close(int sockfd){
-    // send fin
-    // wait for fin ack
-    // wait for fin
-    // send fin ack
+    TCBEntry* it = &TCBTable[sockfd];
+    printf("[CLOSE] ");
+    it->print();
 
+    // send fin
+    stud_tcp_output(NULL, 0, PACKET_TYPE_FIN, it->srcPort, it->destPort, it->srcAddr, it->destAddr);
+    // wait for ack
+    char buffer[1024];
+    if(waitIpPacket((char*)buffer,6) == -1) return -1;
+    TCPHeaderInfo info = TCPHeaderInfo((char*)buffer);
+    info.print();
+    if(!info.is_ack || info.is_fin) return -1;
+    // wait for fin ack
+    if(waitIpPacket((char*)buffer,6) == -1) return -1;
+    info = TCPHeaderInfo((char*)buffer);
+    info.print();
+    if(!info.is_ack || !info.is_fin) return -1;
+    it->nextSeq += 1;
+    it->nextAck = info.seqNo + 1;
+    // send ack
+    stud_tcp_output(NULL, 0, PACKET_TYPE_ACK, it->srcPort, it->destPort, it->srcAddr, it->destAddr);
+    return 0;
 }
