@@ -164,16 +164,7 @@ uint16_t getChecksumNet(uint16_t* temp, int n_trunks, int checksum_idx=14){
     return htons((uint16_t)checksum);
 }
 
-// int getTCPLength(char* buffer){
-//     struct IPHead ipv4Header;
-// 	memcpy(&ipv4Header, buffer, sizeof(struct IPHead));
-// 	// you don't need to convert byte
-// 	uint16_t headerLength = (ipv4Header.ver & 0xf) << 2;
-//     uint16_t totalLength = ntohs(ipv4Header.totalLen);
-//     uint16_t tcp_len = totalLength - headerLength;
-//     printf("%d %d payload len=%d\n", headerLength, totalLength, tcp_len);
-//     return tcp_len;
-// }
+char buffer[1024];  // global buffer
 
 // pseudo header | tcp header | payload
 // Bits:  [0-95] |[96-255]    |[256-N]
@@ -389,26 +380,9 @@ int stud_tcp_connect(int sockfd, struct sockaddr_in *addr, int addrlen){
     it->status = SYN_SENT;
 
     // wait for syn ack
-    char buffer[128];
+//    char buffer[128];
     if(waitIpPacketWrapper((char*)buffer) == -1) return -1;
     stud_tcp_input(buffer, 20, htonl(it->destAddr), htonl(it->srcAddr));
-
-    // TCPHeaderInfo info = TCPHeaderInfo((char*)buffer);
-    // printf("[CONNECT] ");
-    // info.print();
-
-    // if(info.ackNo != it->nextSeq + 1){
-    //     tcp_DiscardPkt(buffer, STUD_TCP_TEST_SEQNO_ERROR);
-    // }
-    // if(info.is_ack && info.is_syn){
-    //     it->nextAck = info.seqNo + 1;
-    //     it->nextSeq = info.seqNo + 1;
-    //     it->status = ESTABLISHED;
-    // } else {
-    //     return -1;  // failed
-    // }
-    // // send ack
-    // stud_tcp_output(NULL, 0, PACKET_TYPE_ACK, it->srcPort, it->destPort, it->srcAddr, it->destAddr);
 
     return 0;
 }
@@ -420,7 +394,7 @@ int stud_tcp_send(int sockfd, const unsigned char *pData, unsigned short datalen
     for(int i = 0; i < datalen; i++) printf("%x ", pData[i]);
     it->print();
 
-    char buffer[1024];
+//    char buffer[1024];
     strcpy(buffer, (char*)pData);
     
     if(it->status != ESTABLISHED){
@@ -429,7 +403,7 @@ int stud_tcp_send(int sockfd, const unsigned char *pData, unsigned short datalen
     stud_tcp_output((char*)pData, datalen, PACKET_TYPE_DATA, it->srcPort, it->destPort, it->srcAddr, it->destAddr);
 
     // expect Ack
-    
+    memset(buffer, 0, sizeof(buffer));
     int tcp_len = 20;
     if((tcp_len = waitIpPacketWrapper((char*)buffer)) == -1) return -1;
 
@@ -440,7 +414,7 @@ int stud_tcp_send(int sockfd, const unsigned char *pData, unsigned short datalen
 
 int stud_tcp_recv(int sockfd, unsigned char *pData, unsigned short datalen, int flags){
     sockfd -= SOCK_OFFSET; // OFFSET
-    printf("[RECV] (%d) len=%d flags=%x \n", datalen, flags);
+    printf("[RECV] (%d) len=%d flags=%x \n", sockfd, datalen, flags);
     TCBEntry* it = &TCBTable[sockfd];
     printf("[RECV] ");
     it->print();
@@ -450,7 +424,7 @@ int stud_tcp_recv(int sockfd, unsigned char *pData, unsigned short datalen, int 
     }
 
     // expect Data
-    char buffer[128];
+//    char buffer[128];
     memset(buffer, 0, sizeof(buffer));
     int tcp_len = 20;
     if((tcp_len = waitIpPacketWrapper((char*)buffer)) == -1) return -1;
@@ -475,7 +449,8 @@ int stud_tcp_close(int sockfd){
     // send fin
     stud_tcp_output(NULL, 0, PACKET_TYPE_FIN, it->srcPort, it->destPort, it->srcAddr, it->destAddr);
     // wait for ack
-    char buffer[128];
+
+    memset(buffer, 0, sizeof(buffer));
     if(waitIpPacketWrapper((char*)buffer) == -1) return -1;
     stud_tcp_input(buffer, 20, htonl(it->destAddr), htonl(it->srcAddr));
     // wait for fin ack
